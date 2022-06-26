@@ -3,49 +3,36 @@
 
 import cv2 as cv
 import numpy as np
-from matplotlib import pyplot as plt
 import argparse
 from typing import Tuple
 from math import inf
 import math
 from itertools import chain
 from datetime import datetime
+from configure import Configurator
+from picamera2 import Picamera2
 
 
-def loadImage(src, size):
-    img = cv.imread(cv.samples.findFile(src))
-    img = cv.resize(img, size)
-    img = cv.medianBlur(img,5)
-    img = cv.cvtColor(img, cv.COLOR_BGR2GRAY)
-    return img
+size=(640, 480)
 
+def detectCactus(img):
+    windowWidth = 10
+    windowHeight = 10
+    start = 40
+    threshold = 0.35
+    centerColorTh = 200
+    edgeColorTh = 128
+    res = []
+    for i in range(start, 256 - windowWidth):
+        currentPart = img[(64 - windowHeight):(64), i : (i + windowWidth)]
+        colorTh = edgeColorTh + (1 - (abs((i + windowWidth // 2) - 128) / 128)) * (centerColorTh - edgeColorTh)
+        if np.count_nonzero(currentPart < colorTh) / currentPart.size >= threshold:
+            res.append((i, 64 - windowHeight, windowWidth, windowHeight))
+    return mergeOverlapingObjects(res)
 
-def extractScreen(img, size):
-    _,imgTh = cv.threshold(img,127,255,cv.THRESH_BINARY)
-
-    visited = set()
-    w,h = size
-    maxX = -inf
-    maxY = -inf
-    minX = inf
-    minY = inf
-    toProcess = [(w // 2,h // 2), (4 * w // 10 ,h // 2), (6 * w // 10 ,h // 2)]
-
-    while len(toProcess) > 0:
-        x,y = toProcess.pop()
-        if (x,y) in visited or x < 0 or y < 0 or x >= w or y >= h or imgTh[y,x] < 200:
-            continue
-        visited.add((x,y))
-        maxX = max(maxX, x)
-        maxY = max(maxY, y)
-        minX = min(minX, x)
-        minY = min(minY, y)
-        toProcess.append((x + 1,y + 1))
-        toProcess.append((x + 1,y - 1))
-        toProcess.append((x - 1,y + 1))
-        toProcess.append((x - 1,y - 1))
-
-    return img[minY : maxY, minX: maxX], (maxX, maxY, minX, minY)
+def detectBirds(img):
+    # TODO
+    return []
 
 
 def detectObjects(img, templates):
@@ -121,41 +108,48 @@ def detectNight(img):
     return blacks > whites
 
 
-def main():
-    cap = cv.VideoCapture('vid/play1.mp4')
-    while cap.isOpened():
-        ret,frame = cap.read()
-        if not ret:
-            continue
-        # screenImage, _ = extractScreen(frame, size)
-        playFiledNormalized = cv.resize(frame, (600,450))
-        playFiledNormalized = cv.cvtColor(playFiledNormalized, cv.COLOR_BGR2GRAY)
-        if detectNight(playFiledNormalized):
-            playFiledNormalized = np.invert(playFiledNormalized)
+def loop(picam2, crop):
+    (maxX, maxY, minX, minY) = crop
+    start = datetime.now()
+    frame = cv.cvtColor(picam2.capture_array(), cv.COLOR_YUV2GRAY_I420)
+    playFiledNormalized = cv.resize(frame[minY : maxY, minX: maxX], (258,64))
+    if detectNight(playFiledNormalized):
+        playFiledNormalized = np.invert(playFiledNormalized)
 
-        dino = mergeOverlapingObjects(detectObjects(playFiledNormalized, [cv.imread('templates/dino.jpg',0)]))
-        cactuses = mergeOverlapingObjects(detectObjects(playFiledNormalized, [
-            cv.imread('templates/cactus_pile1.jpg',0), cv.imread('templates/cactus_pile2.jpg',0), cv.imread('templates/cactus_pile3.jpg',0),
-            cv.imread('templates/cactus_pile4.jpg',0), cv.imread('templates/z_cactus_big1.jpg',0), cv.imread('templates/z_cactus1.jpg',0)
-        ]))
-        birds = mergeOverlapingObjects(detectObjects(playFiledNormalized, [cv.imread('templates/bird_low.jpg',0)]))
-        isGameOver = len(detectObjects(playFiledNormalized, [cv.imread('templates/gameOver.png',0)])) > 0
-        if isGameOver:
-            print("Game over")
+    dino = mergeOverlapingObjects(detectObjects(playFiledNormalized, [cv.imread('templates/dino.jpg',0)]))
+    cactuses = detectCactus(playFiledNormalized)
+    birds = detectBirds(playFiledNormalized)
+    # isGameOver = len(detectObjects(playFiledNormalized, [cv.imread('templates/gameOver.png',0)])) > 0
+    # if isGameOver:
+    #     print("Game over")
 
-        for pt in dino + cactuses + birds:
-            cv.rectangle(playFiledNormalized, (pt[0], pt[1]), (pt[0] + pt[2], pt[1] + pt[3]), (0,0,255), 2)
+    playFiledNormalized = cv.cvtColor(playFiledNormalized,cv.COLOR_GRAY2RGB)
+    for pt in cactuses:
+        cv.rectangle(playFiledNormalized, (pt[0], pt[1]), (pt[0] + pt[2], pt[1] + pt[3]), (0,255,0), 1)
+    for pt in dino:
+        cv.rectangle(playFiledNormalized, (pt[0], pt[1]), (pt[0] + pt[2], pt[1] + pt[3]), (255,0,0), 1)
+    for pt in birds:
+        cv.rectangle(playFiledNormalized, (pt[0], pt[1]), (pt[0] + pt[2], pt[1] + pt[3]), (0,0,255), 1)
 
-        cv.imshow("img", playFiledNormalized)
+
+    cv.imshow("img", cv.resize(playFiledNormalized, (512, 128)))
+    cv.waitKey(1) & 0xFF 
+    print((datetime.now() - start).total_seconds())
         
-        if cv.waitKey(10) & 0xFF == ord('q'):
-            break
 
-    cap.release()
-    cv2.destroyAllWindows()
+def main():
+    picam2 = Picamera2()
+    picam2.configure(picam2.preview_configuration(main={"format": 'YUV420', "size": size}))
+    picam2.start()
+    crop = Configurator().configure(picam2)
 
+    while True:
+        start = datetime.now()
+        loop(picam2, crop)
+        while((datetime.now() - start).total_seconds() < 0.166):
+            pass
 
- 
+    cv.destroyAllWindows()
     
 
 if __name__ == "__main__":
